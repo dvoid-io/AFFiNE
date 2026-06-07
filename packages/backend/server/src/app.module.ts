@@ -61,6 +61,7 @@ import { IndexerModule } from './plugins/indexer';
 import { LicenseModule } from './plugins/license';
 import { OAuthModule } from './plugins/oauth';
 import { PaymentModule } from './plugins/payment';
+import { TokenExchangeModule } from './plugins/token-exchange';
 import { WorkerModule } from './plugins/worker';
 
 export const FunctionalityModules = [
@@ -203,6 +204,7 @@ export function buildAppModule(env: Env) {
       CopilotModule,
       CaptchaModule,
       OAuthModule,
+      TokenExchangeModule,
       CalendarModule,
       TelemetryModule,
       CommentModule,
