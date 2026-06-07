@@ -59,14 +59,28 @@ jobs:
           package: '@affine/server-native'
 
       # `napi build` emits packages/backend/native/server-native.node.
-      # Upstream renames it to the arch-tagged name; docker-clean.mjs keeps
-      # `server-native.x64.node` for TARGETARCH=amd64 and index.js falls back
-      # to it. Rename so the binary survives the docker-clean prune.
-      - name: Rename native binary -> server-native.x64.node
+      # Upstream's build-server-native job runs a 3-arch matrix (x64/arm64/
+      # armv7), each renaming to its arch-tagged file; build-server then
+      # downloads ALL THREE before `affine bundle -p @affine/server`. That
+      # matters because packages/backend/native/index.js statically requires
+      # server-native.{arm64,armv7,x64}.node and the rspack node-loader is NOT
+      # external for relative .node — rspack must resolve every branch on disk
+      # at bundle time or the bundle fails (no dist/main.js emitted).
+      #
+      # We only cross-compile x64 (single-arch Railway target). To reproduce
+      # upstream's on-disk state without building arm, materialize arm64/armv7
+      # as stand-ins from the x64 binary so all three requires resolve. They
+      # are never loaded at runtime on amd64 (index.js picks x64), and
+      # docker-clean.mjs (pruneServerNative, TARGETARCH=amd64) deletes every
+      # server-native.*.node except server-native.x64.node — so the wrong-arch
+      # stand-ins never ship in the final image.
+      - name: Materialize arch-tagged native binaries (x64 real, arm stand-ins)
         run: |
-          mv ./packages/backend/native/server-native.node \
-             ./packages/backend/native/server-native.x64.node
-          ls -alh ./packages/backend/native
+          cd ./packages/backend/native
+          mv server-native.node server-native.x64.node
+          cp server-native.x64.node server-native.arm64.node
+          cp server-native.x64.node server-native.armv7.node
+          ls -alh .
 
       # --- 2. Server (our plugin compiles in here) -----------------------
       # Upstream build-server job: `yarn workspace @affine/server build`
@@ -74,6 +88,18 @@ jobs:
       # packages/backend/server/dist (including ./dist/main.js).
       - name: Build @affine/server
         run: yarn workspace @affine/server build
+
+      # rspack `affine bundle` is non-fatal on module-resolution errors: it
+      # logs "compiled with N errors" but exits 0, so a missing dist/main.js
+      # would silently ship a crash-on-boot image (run 27087832063). Fail
+      # loud here instead — assert the server bundle entrypoint exists.
+      - name: Verify server bundle exists
+        run: |
+          test -f packages/backend/server/dist/main.js \
+            || { echo "::error::server bundle missing — packages/backend/server/dist/main.js was not emitted (rspack bundle failed; check the 'Build @affine/server' step for 'compiled with N errors')"; exit 1; }
+          test -f packages/backend/native/server-native.x64.node \
+            || { echo "::error::native binary missing — packages/backend/native/server-native.x64.node not found"; exit 1; }
+          echo "server bundle present:"; ls -alh packages/backend/server/dist/main.js
 
       # --- 3. Frontend dists (web, admin, mobile) ------------------------
       # Upstream build-web/build-admin/build-mobile jobs. BUILD_TYPE drives
@@ -93,6 +119,18 @@ jobs:
         run: yarn affine @affine/mobile build
         env:
           BUILD_TYPE: ${{ env.BUILD_TYPE }}
+
+      # Same silent-failure guard for the frontend dists the Dockerfile COPYs
+      # into /app/static. An empty/missing dist would ship a server with no UI.
+      - name: Verify frontend dists exist
+        run: |
+          for d in \
+            packages/frontend/apps/web/dist/index.html \
+            packages/frontend/admin/dist/index.html \
+            packages/frontend/apps/mobile/dist/index.html; do
+            test -f "$d" || { echo "::error::frontend dist missing — $d not found"; exit 1; }
+          done
+          echo "frontend dists present"
 
       # --- 4. Production node_modules + Prisma (mirrors build-images) -----
       # Re-resolve a production-only dependency tree into the root
