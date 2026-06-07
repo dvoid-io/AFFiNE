@@ -48,11 +48,13 @@ function makeVerifier(configured: boolean) {
 
 test('exchange: verified email resolves user via fulfill and emits audit event', async t => {
   const verifier = {
-    verify: Sinon.stub().resolves({
-      sub: 'oidc-sub-123',
-      jti: 'jti-1',
+    verifyAndExtractEmail: Sinon.stub().resolves({
+      claims: {
+        sub: 'oidc-sub-123',
+        jti: 'jti-1',
+        name: 'Agent User',
+      },
       email: 'agent-user@affine.pro',
-      name: 'Agent User',
     }),
   } as unknown as OidcAccessTokenVerifier;
 
@@ -72,7 +74,9 @@ test('exchange: verified email resolves user via fulfill and emits audit event',
   const identity = await service.exchange('inbound.jws.token');
 
   t.true(
-    (verifier.verify as Sinon.SinonStub).calledOnceWith('inbound.jws.token')
+    (verifier.verifyAndExtractEmail as Sinon.SinonStub).calledOnceWith(
+      'inbound.jws.token'
+    )
   );
   t.is(fulfill.firstCall.args[0], 'agent-user@affine.pro');
   t.deepEqual(identity, { userId: 'affine-user-42', method: 'oauth' });
@@ -85,9 +89,48 @@ test('exchange: verified email resolves user via fulfill and emits audit event',
   );
 });
 
-test('exchange: token without a valid email claim is rejected (trust boundary)', async t => {
+test('exchange: email resolved via userinfo fallback provisions the user', async t => {
+  // Access token had no email; verifier resolved it from the userinfo endpoint.
   const verifier = {
-    verify: Sinon.stub().resolves({ sub: 'no-email-sub' }),
+    verifyAndExtractEmail: Sinon.stub().resolves({
+      claims: { sub: 'oidc-sub-zitadel', jti: 'jti-z' },
+      email: 'fallback-user@affine.pro',
+    }),
+  } as unknown as OidcAccessTokenVerifier;
+
+  const fulfill = Sinon.stub().resolves({ id: 'affine-user-99' });
+  const getUserByEmail = Sinon.stub().resolves(null);
+  const models = {
+    user: { fulfill, getUserByEmail },
+  } as unknown as Models;
+  const event = makeEvent();
+
+  const service = new TokenExchangeService(
+    verifier,
+    models,
+    makeConfig({}),
+    event
+  );
+  const identity = await service.exchange('inbound.jws.token');
+
+  t.is(fulfill.firstCall.args[0], 'fallback-user@affine.pro');
+  t.deepEqual(identity, { userId: 'affine-user-99', method: 'oauth' });
+  t.true(
+    event.emit.calledOnceWith('tokenExchange.identityMinted', {
+      userId: 'affine-user-99',
+      tokenSub: 'oidc-sub-zitadel',
+      tokenJti: 'jti-z',
+    })
+  );
+});
+
+test('exchange: token without a valid email claim is rejected (trust boundary)', async t => {
+  // Neither the token nor userinfo yielded an email.
+  const verifier = {
+    verifyAndExtractEmail: Sinon.stub().resolves({
+      claims: { sub: 'no-email-sub' },
+      email: undefined,
+    }),
   } as unknown as OidcAccessTokenVerifier;
   const fulfill = Sinon.stub().resolves({ id: 'should-not-happen' });
   const models = {
@@ -107,7 +150,10 @@ test('exchange: token without a valid email claim is rejected (trust boundary)',
 
 test('exchange: new user + allowSignupForOauth=false is forbidden (no provisioning)', async t => {
   const verifier = {
-    verify: Sinon.stub().resolves({ email: 'new-user@affine.pro' }),
+    verifyAndExtractEmail: Sinon.stub().resolves({
+      claims: {},
+      email: 'new-user@affine.pro',
+    }),
   } as unknown as OidcAccessTokenVerifier;
   const fulfill = Sinon.stub().resolves({ id: 'should-not-happen' });
   const getUserByEmail = Sinon.stub().resolves(null);
@@ -128,7 +174,10 @@ test('exchange: new user + allowSignupForOauth=false is forbidden (no provisioni
 
 test('exchange: existing user resolves even when allowSignupForOauth=false', async t => {
   const verifier = {
-    verify: Sinon.stub().resolves({ email: 'existing@affine.pro' }),
+    verifyAndExtractEmail: Sinon.stub().resolves({
+      claims: {},
+      email: 'existing@affine.pro',
+    }),
   } as unknown as OidcAccessTokenVerifier;
   const fulfill = Sinon.stub().resolves({ id: 'affine-user-7' });
   const getUserByEmail = Sinon.stub().resolves({ id: 'affine-user-7' });

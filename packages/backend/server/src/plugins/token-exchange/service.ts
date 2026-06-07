@@ -49,15 +49,19 @@ export class TokenExchangeService {
    * signups also disables provisioning via token-exchange.
    */
   async exchange(accessToken: string): Promise<VerifiedIdentity> {
-    const claims = await this.verifier.verify(accessToken);
+    // Verify the access token and resolve the verified subject's email. The
+    // verifier reads it from the token claims when present, and otherwise falls
+    // back to the OIDC userinfo endpoint — many providers (e.g. Zitadel) scope
+    // `email` to the id_token/userinfo, not the access token.
+    const { claims, email } = await this.verifier.verifyAndExtractEmail(
+      accessToken
+    );
 
-    // Email is the canonical OIDC join key. A provider only emits `email` on
-    // the access token when it is minted with the `email` scope / a claim
-    // mapper; if absent, reject rather than guess.
-    const email = typeof claims.email === 'string' ? claims.email : undefined;
+    // Email is the canonical OIDC join key. If neither the token nor userinfo
+    // yields one, reject rather than guess.
     if (!email) {
       this.logger.warn(
-        'Inbound access token has no `email` claim; cannot resolve user'
+        'Inbound access token has no `email` claim (token or userinfo); cannot resolve user'
       );
       throw new InvalidAuthState();
     }

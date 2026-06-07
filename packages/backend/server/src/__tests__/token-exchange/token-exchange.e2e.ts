@@ -14,7 +14,7 @@ import { createTestingApp, TestingApp } from '../utils';
 
 // e2e for the RFC 8693 token-exchange endpoint. The external OIDC provider is
 // stubbed (no live IdP needed): we override `OidcAccessTokenVerifier` so its
-// `configured` flag and `verify()` claims are controllable, while session
+// `configured` flag and `verifyAndExtractEmail()` result are controllable, while session
 // minting, user provisioning, the signup gate, and cookie replay all run
 // through the real app + database.
 
@@ -27,17 +27,18 @@ const test = ava as TestFn<{
   app: TestingApp;
   verifier: {
     configured: boolean;
-    verify: Sinon.SinonStub;
+    verifyAndExtractEmail: Sinon.SinonStub;
   };
   db: PrismaClient;
 }>;
 
 test.before(async t => {
   // A controllable stand-in for the JWKS verifier — replaces the network /
-  // discovery surface only; everything downstream is the real plugin.
+  // discovery (and userinfo) surface only; everything downstream is the real
+  // plugin.
   const verifier = {
     configured: true,
-    verify: Sinon.stub(),
+    verifyAndExtractEmail: Sinon.stub(),
   };
 
   const app = await createTestingApp({
@@ -118,50 +119,57 @@ test('inert (404) when OIDC provider is not configured', async t => {
 
 test('rejects missing trusted-proxy secret', async t => {
   const { app, verifier } = t.context;
-  verifier.verify.resolves({ email: 'should-not-reach@affine.pro' });
+  verifier.verifyAndExtractEmail.resolves({
+    claims: {},
+    email: 'should-not-reach@affine.pro',
+  });
 
   await exchange(app, undefined).expect(HttpStatus.FORBIDDEN);
-  t.false(verifier.verify.called);
+  t.false(verifier.verifyAndExtractEmail.called);
 });
 
 test('rejects wrong trusted-proxy secret', async t => {
   const { app, verifier } = t.context;
-  verifier.verify.resolves({ email: 'should-not-reach@affine.pro' });
+  verifier.verifyAndExtractEmail.resolves({
+    claims: {},
+    email: 'should-not-reach@affine.pro',
+  });
 
   await exchange(app, 'wrong-secret').expect(HttpStatus.FORBIDDEN);
-  t.false(verifier.verify.called);
+  t.false(verifier.verifyAndExtractEmail.called);
 });
 
 test('rejects invalid/expired token (verify throws)', async t => {
   const { app, verifier } = t.context;
   // mirrors the verifier's failure surface for bad signature / expiry / aud.
   const { InvalidAuthState } = await import('../../base');
-  verifier.verify.rejects(new InvalidAuthState());
+  verifier.verifyAndExtractEmail.rejects(new InvalidAuthState());
 
   await exchange(app, TRUSTED_PROXY_SECRET).expect(HttpStatus.BAD_REQUEST);
-  t.true(verifier.verify.calledOnce);
+  t.true(verifier.verifyAndExtractEmail.calledOnce);
 });
 
 test('rejects malformed RFC 8693 body', async t => {
   const { app, verifier } = t.context;
-  verifier.verify.resolves({ email: 'should-not-reach@affine.pro' });
+  verifier.verifyAndExtractEmail.resolves({
+    claims: {},
+    email: 'should-not-reach@affine.pro',
+  });
 
   await exchange(app, TRUSTED_PROXY_SECRET, {
     grant_type: 'authorization_code',
     subject_token: 'x',
     subject_token_type: TOKEN_TYPE,
   }).expect(HttpStatus.BAD_REQUEST);
-  t.false(verifier.verify.called);
+  t.false(verifier.verifyAndExtractEmail.called);
 });
 
 test('valid token mints a session and provisions the user', async t => {
   const { app, verifier, db } = t.context;
   const email = 'provisioned-user@affine.pro';
-  verifier.verify.resolves({
-    sub: 'oidc-sub-1',
-    jti: 'jti-1',
+  verifier.verifyAndExtractEmail.resolves({
+    claims: { sub: 'oidc-sub-1', jti: 'jti-1', name: 'Provisioned User' },
     email,
-    name: 'Provisioned User',
   });
 
   const res = await exchange(app, TRUSTED_PROXY_SECRET).expect(HttpStatus.OK);
@@ -188,13 +196,45 @@ test('valid token mints a session and provisions the user', async t => {
   t.is(sessionRes.body.user.email, email);
 });
 
+test('email resolved via userinfo fallback (absent on token) mints a session', async t => {
+  const { app, verifier, db } = t.context;
+  // The access token carried no email (Zitadel-style); the verifier resolved it
+  // from the OIDC userinfo endpoint and returns it through the same shape.
+  const email = 'userinfo-fallback@affine.pro';
+  verifier.verifyAndExtractEmail.resolves({
+    claims: { sub: 'oidc-sub-zitadel', jti: 'jti-z' },
+    email,
+  });
+
+  const res = await exchange(app, TRUSTED_PROXY_SECRET).expect(HttpStatus.OK);
+  t.truthy(res.body.access_token);
+
+  const user = await db.user.findFirst({ where: { email } });
+  t.truthy(user);
+});
+
+test('email absent on token AND userinfo is rejected (no email anywhere)', async t => {
+  const { app, verifier } = t.context;
+  // Neither the token nor userinfo yielded an email → no resolvable user.
+  verifier.verifyAndExtractEmail.resolves({
+    claims: { sub: 'no-email-sub' },
+    email: undefined,
+  });
+
+  await exchange(app, TRUSTED_PROXY_SECRET).expect(HttpStatus.BAD_REQUEST);
+  t.true(verifier.verifyAndExtractEmail.calledOnce);
+});
+
 test('respects signup gate: new user rejected when allowSignupForOauth=false', async t => {
   const { app, verifier, db } = t.context;
   app.get(ConfigFactory).override({
     auth: { allowSignupForOauth: false },
   });
   const email = 'gated-new-user@affine.pro';
-  verifier.verify.resolves({ sub: 'oidc-sub-2', email });
+  verifier.verifyAndExtractEmail.resolves({
+    claims: { sub: 'oidc-sub-2' },
+    email,
+  });
 
   await exchange(app, TRUSTED_PROXY_SECRET).expect(HttpStatus.FORBIDDEN);
 
@@ -207,8 +247,8 @@ test('audience mismatch is rejected (verifier rejects aud-failed token)', async 
   // the verifier enforces `aud` via jwtVerify; a mismatch surfaces as the same
   // InvalidAuthState. We model that here by having verify reject.
   const { InvalidAuthState } = await import('../../base');
-  verifier.verify.rejects(new InvalidAuthState());
+  verifier.verifyAndExtractEmail.rejects(new InvalidAuthState());
 
   await exchange(app, TRUSTED_PROXY_SECRET).expect(HttpStatus.BAD_REQUEST);
-  t.true(verifier.verify.calledOnce);
+  t.true(verifier.verifyAndExtractEmail.calledOnce);
 });
