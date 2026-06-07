@@ -1,4 +1,3 @@
-import { Button } from '@affine/component/ui/button';
 import { WorkspaceDialogService } from '@affine/core/modules/dialogs';
 import { appIconMap, appNames } from '@affine/core/utils/channel';
 import { Trans, useI18n } from '@affine/i18n';
@@ -18,8 +17,6 @@ interface OpenAppProps {
   mode?: 'auth' | 'open-doc'; // default to 'auth'
 }
 const channel = BUILD_CONFIG.appBuildType;
-const url =
-  'https://affine.pro/download' + (channel !== 'stable' ? '/beta-canary' : '');
 
 export const OpenInAppPage = ({
   urlToOpen,
@@ -30,10 +27,6 @@ export const OpenInAppPage = ({
   urlToOpen ??= getOpenUrlInDesktopAppLink(window.location.href, true);
   const workspaceDialogService = useServiceOptional(WorkspaceDialogService);
   const t = useI18n();
-
-  const openDownloadLink = useCallback(() => {
-    open(url, '_blank');
-  }, []);
 
   const appIcon = appIconMap[channel];
   const appName = appNames[channel];
@@ -90,10 +83,7 @@ export const OpenInAppPage = ({
             Contact us
           </a>
         </div>
-
-        <Button onClick={openDownloadLink}>
-          {t['com.affine.auth.open.affine.download-app']()}
-        </Button>
+        {/* dvoid self-host: "Download app" CTA removed (org-specific, never upstream). */}
       </div>
 
       <div className={styles.centerContent}>

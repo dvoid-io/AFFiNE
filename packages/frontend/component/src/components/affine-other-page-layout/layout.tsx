@@ -1,8 +1,6 @@
-import { Button } from '@affine/component/ui/button';
-import { useI18n } from '@affine/i18n';
 import { Logo1Icon } from '@blocksuite/icons/rc';
 import { useTheme } from 'next-themes';
-import { type ReactNode, useCallback } from 'react';
+import { type ReactNode } from 'react';
 
 import dotBgDark from './assets/dot-bg.dark.png';
 import dotBgLight from './assets/dot-bg.light.png';
@@ -15,12 +13,6 @@ export const AffineOtherPageLayout = ({
 }: {
   children: ReactNode;
 }) => {
-  const t = useI18n();
-
-  const openDownloadLink = useCallback(() => {
-    open(BUILD_CONFIG.downloadUrl, '_blank');
-  }, []);
-
   const { resolvedTheme } = useTheme();
   const backgroundImage =
     resolvedTheme === 'dark' && dotBgDark ? dotBgDark : dotBgLight;
@@ -39,12 +31,7 @@ export const AffineOtherPageLayout = ({
           </a>
 
           <DesktopNavbar />
-          <Button
-            onClick={openDownloadLink}
-            className={styles.hideInSmallScreen}
-          >
-            {t['com.affine.auth.open.affine.download-app']()}
-          </Button>
+          {/* dvoid self-host: "Download app" CTA removed (org-specific, never upstream). */}
           <MobileNavbar />
         </div>
       )}
