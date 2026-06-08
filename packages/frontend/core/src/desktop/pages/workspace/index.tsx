@@ -34,6 +34,7 @@ import {
 import { map } from 'rxjs';
 import * as _Y from 'yjs';
 
+import { useNotifyDvoidParent } from '../../../modules/workspace/dvoid-parent-notify';
 import { AffineErrorBoundary } from '../../../components/affine/affine-error-boundary';
 import { WorkbenchRoot } from '../../../modules/workbench';
 import { AppContainer } from '../../components/app-container';
@@ -266,6 +267,10 @@ const WorkspacePage = ({ meta }: { meta: WorkspaceMetadata }) => {
     [workspace]
   );
   const isRootDocReady = useLiveData(rootDocReady$) ?? false;
+
+  // dvoid self-host: notify the embedding shell iframe of the active app
+  // context (workspace + open doc).
+  useNotifyDvoidParent(workspace, globalContextService);
 
   useEffect(() => {
     if (workspace) {
