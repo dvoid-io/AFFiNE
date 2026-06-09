@@ -8,15 +8,17 @@ import { TokenExchangeController } from '../controller';
 import { TokenExchangeService } from '../service';
 import type { OidcAccessTokenVerifier } from '../verifier';
 
-// Unit-test the seam in isolation: mock the JWKS verify + the user model, then
-// assert verify(access_token) → id_token email → (signup gate) → fulfill(email)
-// → identity, and that the controller enforces the trusted-proxy secret (and
-// inert-when-unconfigured gate) and the required RFC 8693 token pair before
-// handing the identity to SessionIssuer.issue.
+// Unit-test the seam in isolation. Identity joins on the Zitadel `sub` via the
+// ConnectedAccount map (the same the OIDC login uses):
+//   - resolve: getConnectedAccount(sub) → user (no id_token, no email)
+//   - provision: sub unlinked + id_token → fulfill(email) + createConnectedAccount
+// and the controller enforces the trusted-proxy secret, the inert gate, and the
+// required subject_token / optional actor_token before delegating.
 
 const GRANT = 'urn:ietf:params:oauth:grant-type:token-exchange';
 const ACCESS_TOKEN_TYPE = 'urn:ietf:params:oauth:token-type:access_token';
 const ID_TOKEN_TYPE = 'urn:ietf:params:oauth:token-type:id_token';
+const OIDC = 'oidc';
 
 function makeConfig(overrides: {
   allowSignupForOauth?: boolean;
@@ -36,13 +38,14 @@ function makeEvent(): EventBus & { emit: Sinon.SinonStub } {
   };
 }
 
-function makeBody(subjectToken: string, actorToken = 'inbound.id.token') {
+function makeBody(subjectToken: string, actorToken?: string) {
   return {
     grant_type: GRANT,
     subject_token: subjectToken,
     subject_token_type: ACCESS_TOKEN_TYPE,
-    actor_token: actorToken,
-    actor_token_type: ID_TOKEN_TYPE,
+    ...(actorToken
+      ? { actor_token: actorToken, actor_token_type: ID_TOKEN_TYPE }
+      : {}),
   };
 }
 
@@ -50,11 +53,7 @@ function makeVerifier(configured: boolean) {
   return { configured } as unknown as OidcAccessTokenVerifier;
 }
 
-/**
- * A verifier double: `verify` resolves the access-token claims (sub/jti),
- * `verifyIdTokenEmail` resolves the id_token-derived email + name.
- */
-function serviceVerifier(opts: {
+function verifierStub(opts: {
   accessClaims: Record<string, unknown>;
   identity?: { email: string; name?: string };
   idTokenThrows?: boolean;
@@ -68,158 +67,243 @@ function serviceVerifier(opts: {
   } as unknown as OidcAccessTokenVerifier;
 }
 
-test('exchange: access sub + id_token email resolves user via fulfill and emits audit', async t => {
-  const verifier = serviceVerifier({
-    accessClaims: { sub: 'oidc-sub-123', jti: 'jti-1' },
-    identity: { email: 'agent-user@affine.pro', name: 'Agent User' },
-  });
+function modelsStub(opts: {
+  connectedAccount?: { userId: string } | null;
+  userByEmail?: { id: string } | null;
+  fulfillId?: string;
+}) {
+  const getConnectedAccount = Sinon.stub().resolves(
+    opts.connectedAccount ?? null
+  );
+  const getUserByEmail = Sinon.stub().resolves(opts.userByEmail ?? null);
+  const fulfill = Sinon.stub().resolves({ id: opts.fulfillId ?? 'affine-new' });
+  const createConnectedAccount = Sinon.stub().resolves({});
+  return {
+    models: {
+      user: {
+        getConnectedAccount,
+        getUserByEmail,
+        fulfill,
+        createConnectedAccount,
+      },
+    } as unknown as Models,
+    getConnectedAccount,
+    getUserByEmail,
+    fulfill,
+    createConnectedAccount,
+  };
+}
 
-  const fulfill = Sinon.stub().resolves({ id: 'affine-user-42' });
-  const getUserByEmail = Sinon.stub().resolves(null);
-  const models = {
-    user: { fulfill, getUserByEmail },
-  } as unknown as Models;
+test('exchange: sub with a ConnectedAccount resolves WITHOUT an id_token', async t => {
+  const verifier = verifierStub({
+    accessClaims: { sub: 'sub-1', jti: 'jti-1' },
+  });
+  const m = modelsStub({ connectedAccount: { userId: 'affine-user-42' } });
   const event = makeEvent();
 
   const service = new TokenExchangeService(
     verifier,
-    models,
+    m.models,
     makeConfig({}),
     event
   );
-  const identity = await service.exchange('access.tok', 'id.tok');
+  const identity = await service.exchange('access.tok');
 
-  t.true((verifier.verify as Sinon.SinonStub).calledOnceWith('access.tok'));
-  t.true(
-    (verifier.verifyIdTokenEmail as Sinon.SinonStub).calledOnceWith(
-      'id.tok',
-      'oidc-sub-123'
-    )
-  );
-  t.is(fulfill.firstCall.args[0], 'agent-user@affine.pro');
-  t.deepEqual(fulfill.firstCall.args[1], { name: 'Agent User' });
+  t.true(m.getConnectedAccount.calledOnceWith(OIDC, 'sub-1'));
+  t.false((verifier.verifyIdTokenEmail as Sinon.SinonStub).called);
+  t.false(m.fulfill.called);
+  t.false(m.createConnectedAccount.called);
   t.deepEqual(identity, { userId: 'affine-user-42', method: 'oauth' });
   t.true(
     event.emit.calledOnceWith('tokenExchange.identityMinted', {
       userId: 'affine-user-42',
-      tokenSub: 'oidc-sub-123',
+      tokenSub: 'sub-1',
       tokenJti: 'jti-1',
     })
   );
 });
 
-test('exchange: access token without a sub is rejected before touching the id_token', async t => {
-  const verifier = serviceVerifier({
-    accessClaims: { jti: 'no-sub' },
-    identity: { email: 'should-not@affine.pro' },
+test('exchange: unlinked sub + id_token provisions and links the user', async t => {
+  const verifier = verifierStub({
+    accessClaims: { sub: 'sub-new', jti: 'jti-n' },
+    identity: { email: 'agent@affine.pro', name: 'Agent User' },
   });
-  const fulfill = Sinon.stub().resolves({ id: 'should-not-happen' });
-  const models = {
-    user: { fulfill, getUserByEmail: Sinon.stub() },
-  } as unknown as Models;
+  const m = modelsStub({
+    connectedAccount: null,
+    userByEmail: null,
+    fulfillId: 'affine-user-99',
+  });
 
   const service = new TokenExchangeService(
     verifier,
-    models,
+    m.models,
+    makeConfig({}),
+    makeEvent()
+  );
+  const identity = await service.exchange('access.tok', 'id.tok');
+
+  t.true(
+    (verifier.verifyIdTokenEmail as Sinon.SinonStub).calledOnceWith(
+      'id.tok',
+      'sub-new'
+    )
+  );
+  t.is(m.fulfill.firstCall.args[0], 'agent@affine.pro');
+  t.deepEqual(m.createConnectedAccount.firstCall.args[0], {
+    userId: 'affine-user-99',
+    provider: OIDC,
+    providerAccountId: 'sub-new',
+    accessToken: 'access.tok',
+  });
+  t.deepEqual(identity, { userId: 'affine-user-99', method: 'oauth' });
+});
+
+test('exchange: unlinked sub + existing email-user links the sub (backfill)', async t => {
+  const verifier = verifierStub({
+    accessClaims: { sub: 'sub-legacy' },
+    identity: { email: 'legacy@affine.pro', name: undefined },
+  });
+  // fulfill upserts → returns the existing email-created user; we then link sub.
+  const m = modelsStub({
+    connectedAccount: null,
+    userByEmail: { id: 'affine-user-7' },
+    fulfillId: 'affine-user-7',
+  });
+
+  const service = new TokenExchangeService(
+    verifier,
+    m.models,
+    makeConfig({}),
+    makeEvent()
+  );
+  const identity = await service.exchange('access.tok', 'id.tok');
+
+  t.is(identity.userId, 'affine-user-7');
+  t.is(
+    m.createConnectedAccount.firstCall.args[0].providerAccountId,
+    'sub-legacy'
+  );
+  t.is(m.createConnectedAccount.firstCall.args[0].userId, 'affine-user-7');
+});
+
+test('exchange: unlinked sub with NO id_token is rejected (not provisioned)', async t => {
+  const verifier = verifierStub({ accessClaims: { sub: 'sub-unprovisioned' } });
+  const m = modelsStub({ connectedAccount: null });
+
+  const service = new TokenExchangeService(
+    verifier,
+    m.models,
+    makeConfig({}),
+    makeEvent()
+  );
+
+  await t.throwsAsync(service.exchange('access.tok'));
+  t.false((verifier.verifyIdTokenEmail as Sinon.SinonStub).called);
+  t.false(m.fulfill.called);
+});
+
+test('exchange: access token without a sub is rejected', async t => {
+  const verifier = verifierStub({ accessClaims: { jti: 'no-sub' } });
+  const m = modelsStub({ connectedAccount: { userId: 'x' } });
+
+  const service = new TokenExchangeService(
+    verifier,
+    m.models,
     makeConfig({}),
     makeEvent()
   );
 
   await t.throwsAsync(service.exchange('access.tok', 'id.tok'));
-  t.false((verifier.verifyIdTokenEmail as Sinon.SinonStub).called);
-  t.false(fulfill.called);
+  t.false(m.getConnectedAccount.called);
 });
 
 test('exchange: id_token email resolution failure propagates (no provisioning)', async t => {
-  const verifier = serviceVerifier({
+  const verifier = verifierStub({
     accessClaims: { sub: 'sub-1' },
     idTokenThrows: true,
   });
-  const fulfill = Sinon.stub().resolves({ id: 'should-not-happen' });
-  const models = {
-    user: { fulfill, getUserByEmail: Sinon.stub() },
-  } as unknown as Models;
+  const m = modelsStub({ connectedAccount: null });
 
   const service = new TokenExchangeService(
     verifier,
-    models,
+    m.models,
     makeConfig({}),
     makeEvent()
   );
 
   await t.throwsAsync(service.exchange('access.tok', 'id.tok'));
-  t.false(fulfill.called);
+  t.false(m.fulfill.called);
 });
 
-test('exchange: new user + allowSignupForOauth=false is forbidden (no provisioning)', async t => {
-  const verifier = serviceVerifier({
-    accessClaims: { sub: 'sub-1' },
-    identity: { email: 'new-user@affine.pro' },
+test('exchange: new user + allowSignupForOauth=false is forbidden', async t => {
+  const verifier = verifierStub({
+    accessClaims: { sub: 'sub-new' },
+    identity: { email: 'new@affine.pro' },
   });
-  const fulfill = Sinon.stub().resolves({ id: 'should-not-happen' });
-  const getUserByEmail = Sinon.stub().resolves(null);
-  const models = {
-    user: { fulfill, getUserByEmail },
-  } as unknown as Models;
+  const m = modelsStub({ connectedAccount: null, userByEmail: null });
 
   const service = new TokenExchangeService(
     verifier,
-    models,
+    m.models,
     makeConfig({ allowSignupForOauth: false }),
     makeEvent()
   );
 
   await t.throwsAsync(service.exchange('access.tok', 'id.tok'));
-  t.false(fulfill.called);
+  t.false(m.fulfill.called);
 });
 
-test('exchange: existing user resolves even when allowSignupForOauth=false', async t => {
-  const verifier = serviceVerifier({
-    accessClaims: { sub: 'sub-1' },
-    identity: { email: 'existing@affine.pro' },
-  });
-  const fulfill = Sinon.stub().resolves({ id: 'affine-user-7' });
-  const getUserByEmail = Sinon.stub().resolves({ id: 'affine-user-7' });
-  const models = {
-    user: { fulfill, getUserByEmail },
-  } as unknown as Models;
-
-  const service = new TokenExchangeService(
-    verifier,
-    models,
-    makeConfig({ allowSignupForOauth: false }),
-    makeEvent()
-  );
-
-  const identity = await service.exchange('access.tok', 'id.tok');
-  t.is(identity.userId, 'affine-user-7');
-  t.true(fulfill.calledOnce);
-});
-
-test('controller: valid secret + RFC 8693 body → SessionIssuer.issue, returns RFC 8693 response', async t => {
+test('controller: resolution body (no actor_token) → exchange(subject, undefined)', async t => {
   const identity = { userId: 'affine-user-42', method: 'oauth' as const };
   const issue = Sinon.stub().resolves({
     userId: 'affine-user-42',
     sessionId: 'sess-abc',
   });
-  const sessionIssuer = { issue } as any;
   const tokenExchange = { exchange: Sinon.stub().resolves(identity) } as any;
 
   const controller = new TokenExchangeController(
     makeConfig({ trustedProxySecret: 'top-secret' }),
-    sessionIssuer,
+    { issue } as any,
     tokenExchange,
     makeVerifier(true)
   );
-
-  const req = {} as Request;
   const sent: unknown[] = [];
-  const res = {
-    send: (body: unknown) => sent.push(body),
-  } as unknown as Response;
+  const res = { send: (b: unknown) => sent.push(b) } as unknown as Response;
 
   await controller.exchange(
-    req,
+    {} as Request,
+    res,
+    makeBody('inbound.jws.token'),
+    'top-secret'
+  );
+
+  t.true(tokenExchange.exchange.calledOnceWith('inbound.jws.token', undefined));
+  t.true(issue.calledOnce);
+  t.deepEqual(sent[0], {
+    access_token: 'sess-abc',
+    issued_token_type: 'urn:ietf:params:oauth:token-type:access_token',
+    token_type: 'Bearer',
+  });
+});
+
+test('controller: provisioning body (with actor_token) → exchange(subject, actor)', async t => {
+  const identity = { userId: 'affine-user-42', method: 'oauth' as const };
+  const issue = Sinon.stub().resolves({
+    userId: 'affine-user-42',
+    sessionId: 'sess-abc',
+  });
+  const tokenExchange = { exchange: Sinon.stub().resolves(identity) } as any;
+
+  const controller = new TokenExchangeController(
+    makeConfig({ trustedProxySecret: 'top-secret' }),
+    { issue } as any,
+    tokenExchange,
+    makeVerifier(true)
+  );
+  const res = { send: Sinon.stub() } as unknown as Response;
+
+  await controller.exchange(
+    {} as Request,
     res,
     makeBody('inbound.jws.token', 'inbound.id.token'),
     'top-secret'
@@ -231,24 +315,13 @@ test('controller: valid secret + RFC 8693 body → SessionIssuer.issue, returns 
       'inbound.id.token'
     )
   );
-  t.true(issue.calledOnce);
-  t.is(issue.firstCall.args[0], req);
-  t.is(issue.firstCall.args[1], res);
-  t.deepEqual(issue.firstCall.args[2], identity);
-  // RFC 8693 §2.2.1 response: session id surfaced as the issued access token.
-  t.deepEqual(sent[0], {
-    access_token: 'sess-abc',
-    issued_token_type: 'urn:ietf:params:oauth:token-type:access_token',
-    token_type: 'Bearer',
-  });
 });
 
 test('controller: inert (NotFound) when trusted-proxy secret is unconfigured', async t => {
-  const issue = Sinon.stub();
   const exchange = Sinon.stub();
   const controller = new TokenExchangeController(
     makeConfig({ trustedProxySecret: '' }),
-    { issue } as any,
+    { issue: Sinon.stub() } as any,
     { exchange } as any,
     makeVerifier(true)
   );
@@ -258,15 +331,13 @@ test('controller: inert (NotFound) when trusted-proxy secret is unconfigured', a
     controller.exchange({} as Request, res, makeBody('t'), 'anything')
   );
   t.false(exchange.called);
-  t.false(issue.called);
 });
 
 test('controller: inert (NotFound) when OIDC verifier is not configured', async t => {
-  const issue = Sinon.stub();
   const exchange = Sinon.stub();
   const controller = new TokenExchangeController(
     makeConfig({ trustedProxySecret: 'top-secret' }),
-    { issue } as any,
+    { issue: Sinon.stub() } as any,
     { exchange } as any,
     makeVerifier(false)
   );
@@ -276,71 +347,45 @@ test('controller: inert (NotFound) when OIDC verifier is not configured', async 
     controller.exchange({} as Request, res, makeBody('t'), 'top-secret')
   );
   t.false(exchange.called);
-  t.false(issue.called);
 });
 
 test('controller: wrong/missing trusted-proxy secret is rejected before any work', async t => {
-  const issue = Sinon.stub();
   const exchange = Sinon.stub();
   const controller = new TokenExchangeController(
     makeConfig({ trustedProxySecret: 'top-secret' }),
-    { issue } as any,
+    { issue: Sinon.stub() } as any,
     { exchange } as any,
     makeVerifier(true)
   );
   const res = { send: Sinon.stub() } as unknown as Response;
 
-  // missing secret
   await t.throwsAsync(
     controller.exchange({} as Request, res, makeBody('t'), undefined)
   );
-  // wrong secret
   await t.throwsAsync(
     controller.exchange({} as Request, res, makeBody('t'), 'wrong')
   );
   t.false(exchange.called);
-  t.false(issue.called);
 });
 
-test('controller: valid secret but malformed RFC 8693 body is rejected', async t => {
-  const issue = Sinon.stub();
+test('controller: malformed body (missing subject_token / wrong grant_type) rejected', async t => {
   const exchange = Sinon.stub();
   const controller = new TokenExchangeController(
     makeConfig({ trustedProxySecret: 'top-secret' }),
-    { issue } as any,
+    { issue: Sinon.stub() } as any,
     { exchange } as any,
     makeVerifier(true)
   );
   const res = { send: Sinon.stub() } as unknown as Response;
 
-  // missing subject_token
   await t.throwsAsync(
     controller.exchange(
       {} as Request,
       res,
-      {
-        grant_type: GRANT,
-        subject_token_type: ACCESS_TOKEN_TYPE,
-        actor_token: 'id',
-        actor_token_type: ID_TOKEN_TYPE,
-      },
+      { grant_type: GRANT, subject_token_type: ACCESS_TOKEN_TYPE },
       'top-secret'
     )
   );
-  // missing actor_token (id_token) — no fallback, so this must be rejected
-  await t.throwsAsync(
-    controller.exchange(
-      {} as Request,
-      res,
-      {
-        grant_type: GRANT,
-        subject_token: 't',
-        subject_token_type: ACCESS_TOKEN_TYPE,
-      },
-      'top-secret'
-    )
-  );
-  // wrong grant_type
   await t.throwsAsync(
     controller.exchange(
       {} as Request,
@@ -349,12 +394,9 @@ test('controller: valid secret but malformed RFC 8693 body is rejected', async t
         grant_type: 'authorization_code',
         subject_token: 't',
         subject_token_type: ACCESS_TOKEN_TYPE,
-        actor_token: 'id',
-        actor_token_type: ID_TOKEN_TYPE,
       },
       'top-secret'
     )
   );
   t.false(exchange.called);
-  t.false(issue.called);
 });

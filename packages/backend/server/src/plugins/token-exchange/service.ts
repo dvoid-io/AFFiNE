@@ -9,6 +9,7 @@ import {
 import type { VerifiedIdentity } from '../../core/auth';
 import { validators } from '../../core/utils/validators';
 import { Models } from '../../models';
+import { OAuthProviderName } from '../oauth/config';
 import { OidcAccessTokenVerifier } from './verifier';
 
 declare global {
@@ -38,23 +39,32 @@ export class TokenExchangeService {
   ) {}
 
   /**
-   * verify → bind id_token → extract email → resolve/auto-provision → identity.
+   * Resolve (or first-time provision) the AFFiNE user behind a Zitadel identity.
    *
-   * Headless analog of `OAuthService.verifyCallbackIdentity`:
-   *   - login path:  getToken → getUser → getOrCreateUserFromOauth → identity
-   *   - this path:   verify(access_token) → email(id_token) → fulfill → identity
+   * The join key is the **Zitadel `sub`** — stable and immutable — mapped to an
+   * AFFiNE user through the same `ConnectedAccount` table the OIDC login uses
+   * (`OAuthService.getOrCreateUserFromOauth`). Two shapes:
    *
-   * Auto-provision is gated on `auth.allowSignupForOauth`, identical to
-   * `OAuthService.getOrCreateUserFromOauth` — so an operator who disables OAuth
-   * signups also disables provisioning via token-exchange.
+   *   - **Resolve** (`idToken` absent): the common runtime path. The `sub` from
+   *     the verified access token resolves an existing `ConnectedAccount` →
+   *     done. No email, no id_token — email changes never affect identity.
+   *   - **Provision/link** (`idToken` present): the login path. When the `sub`
+   *     is not yet linked, the id_token supplies the email needed to create the
+   *     AFFiNE user (or link the `sub` to an existing email-matched user) — the
+   *     identical `fulfill(email)` + `createConnectedAccount(sub)` the OIDC
+   *     login performs. The id_token is only ever in hand at login, so that is
+   *     where provisioning happens; the runtime MCP path never carries it.
+   *
+   * A `sub` with no `ConnectedAccount` and no id_token means "not provisioned
+   * yet" — it fails fast rather than guessing. Auto-provision is gated on
+   * `auth.allowSignupForOauth`, identical to the OIDC login.
    */
   async exchange(
     accessToken: string,
-    idToken: string
+    idToken?: string
   ): Promise<VerifiedIdentity> {
     // Verify the access token (RFC 8693 subject_token) — enforces the resource
-    // audience and yields the authorized subject. The access token does not
-    // carry email (Zitadel-style); that comes from the id_token next.
+    // audience and yields the authorized Zitadel subject.
     const claims = await this.verifier.verify(accessToken);
     const sub = typeof claims.sub === 'string' ? claims.sub : undefined;
     if (!sub) {
@@ -64,10 +74,32 @@ export class TokenExchangeService {
       throw new InvalidAuthState();
     }
 
-    // Resolve email (+ name) from the id_token (RFC 8693 actor_token), bound to
-    // the same subject. No userinfo hop, no fallback — `verifyIdTokenEmail`
-    // fails fast with a precise cause if the id_token is bad, mismatched, or
-    // carries no email.
+    // Resolve by the stable Zitadel subject via the same ConnectedAccount map
+    // the OIDC login uses — no email, no id_token, immutable across email
+    // changes.
+    const connected = await this.models.user.getConnectedAccount(
+      OAuthProviderName.OIDC,
+      sub
+    );
+    if (connected) {
+      this.event.emit('tokenExchange.identityMinted', {
+        userId: connected.userId,
+        tokenSub: sub,
+        tokenJti: typeof claims.jti === 'string' ? claims.jti : undefined,
+      });
+      return { userId: connected.userId, method: 'oauth' };
+    }
+
+    // Not linked yet → provision/link. This needs the user's email, which only
+    // the id_token carries. Runtime MCP calls omit it (resolution only), so a
+    // missing id_token here means the user was never provisioned at login.
+    if (!idToken) {
+      this.logger.warn(
+        'No ConnectedAccount for the Zitadel subject and no id_token to provision; the user must be provisioned at login first'
+      );
+      throw new InvalidAuthState();
+    }
+
     const { email, name } = await this.verifier.verifyIdTokenEmail(
       idToken,
       sub
@@ -79,23 +111,25 @@ export class TokenExchangeService {
       throw new SignUpForbidden();
     }
 
-    // Resolve existing user by email, or create a registered, email-verified
-    // user — the same `models.user.fulfill(...)` call the OAuth signup path
-    // makes (`plugins/oauth/service.ts`). The display name comes from the
-    // id_token (the access token carries no profile claims).
+    // `fulfill` upserts by email — links the `sub` to an existing email-created
+    // user (backfilling legacy users) or creates a fresh registered user. Then
+    // record the `sub` → user mapping so every future call resolves by `sub`.
     const user = await this.models.user.fulfill(email, { name });
+    await this.models.user.createConnectedAccount({
+      userId: user.id,
+      provider: OAuthProviderName.OIDC,
+      providerAccountId: sub,
+      // The ConnectedAccount row requires an access token; the Zitadel access
+      // token is the natural analog of the OIDC login's stored access token.
+      accessToken,
+    });
 
-    // Audit: "trusted caller acted AS user X" provenance, wired through
-    // AFFiNE's event system rather than a bespoke log sink.
     this.event.emit('tokenExchange.identityMinted', {
       userId: user.id,
       tokenSub: sub,
       tokenJti: typeof claims.jti === 'string' ? claims.jti : undefined,
     });
 
-    return {
-      userId: user.id,
-      method: 'oauth',
-    };
+    return { userId: user.id, method: 'oauth' };
   }
 }

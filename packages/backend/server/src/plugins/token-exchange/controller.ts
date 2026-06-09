@@ -35,17 +35,18 @@ const TRUSTED_PROXY_SECRET_HEADER = 'x-affine-trusted-proxy-secret';
  * accepts). The request is validated with zod, mirroring how
  * `OAuthController` validates its callback body (`plugins/oauth/controller.ts`).
  *
- * Both tokens are REQUIRED — there is no userinfo fallback. The `subject_token`
- * (access token) authorizes the exchange and carries the audience-checked
- * subject; the `actor_token` (id_token) carries the `email`. A request missing
- * either fails validation here (`BadRequest`) rather than degrading.
+ * The `subject_token` (access token) is REQUIRED — it authorizes the exchange
+ * and carries the audience-checked Zitadel `sub`, which resolves the AFFiNE user
+ * by `ConnectedAccount`. The `actor_token` (id_token) is OPTIONAL: it is only
+ * needed to first-time provision/link a `sub` (it carries the email), and is
+ * sent at login. Runtime resolution omits it. There is no userinfo fallback.
  */
 const TokenExchangeBodySchema = z.object({
   grant_type: z.literal(TOKEN_EXCHANGE_GRANT_TYPE),
   subject_token: z.string().min(1),
   subject_token_type: z.literal(ACCESS_TOKEN_TYPE),
-  actor_token: z.string().min(1),
-  actor_token_type: z.literal(ID_TOKEN_TYPE),
+  actor_token: z.string().min(1).optional(),
+  actor_token_type: z.literal(ID_TOKEN_TYPE).optional(),
 });
 
 /**
