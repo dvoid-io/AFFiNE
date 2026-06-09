@@ -9,12 +9,14 @@ import { TokenExchangeService } from '../service';
 import type { OidcAccessTokenVerifier } from '../verifier';
 
 // Unit-test the seam in isolation: mock the JWKS verify + the user model, then
-// assert verify → (signup gate) → fulfill(email) → identity, and that the
-// controller enforces the trusted-proxy secret (and inert-when-unconfigured
-// gate) before handing the identity to SessionIssuer.issue.
+// assert verify(access_token) → id_token email → (signup gate) → fulfill(email)
+// → identity, and that the controller enforces the trusted-proxy secret (and
+// inert-when-unconfigured gate) and the required RFC 8693 token pair before
+// handing the identity to SessionIssuer.issue.
 
 const GRANT = 'urn:ietf:params:oauth:grant-type:token-exchange';
-const TOKEN_TYPE = 'urn:ietf:params:oauth:token-type:access_token';
+const ACCESS_TOKEN_TYPE = 'urn:ietf:params:oauth:token-type:access_token';
+const ID_TOKEN_TYPE = 'urn:ietf:params:oauth:token-type:id_token';
 
 function makeConfig(overrides: {
   allowSignupForOauth?: boolean;
@@ -34,11 +36,13 @@ function makeEvent(): EventBus & { emit: Sinon.SinonStub } {
   };
 }
 
-function makeBody(subjectToken: string) {
+function makeBody(subjectToken: string, actorToken = 'inbound.id.token') {
   return {
     grant_type: GRANT,
     subject_token: subjectToken,
-    subject_token_type: TOKEN_TYPE,
+    subject_token_type: ACCESS_TOKEN_TYPE,
+    actor_token: actorToken,
+    actor_token_type: ID_TOKEN_TYPE,
   };
 }
 
@@ -46,17 +50,29 @@ function makeVerifier(configured: boolean) {
   return { configured } as unknown as OidcAccessTokenVerifier;
 }
 
-test('exchange: verified email resolves user via fulfill and emits audit event', async t => {
-  const verifier = {
-    verifyAndExtractEmail: Sinon.stub().resolves({
-      claims: {
-        sub: 'oidc-sub-123',
-        jti: 'jti-1',
-        name: 'Agent User',
-      },
-      email: 'agent-user@affine.pro',
-    }),
+/**
+ * A verifier double: `verify` resolves the access-token claims (sub/jti),
+ * `verifyIdTokenEmail` resolves the id_token-derived email + name.
+ */
+function serviceVerifier(opts: {
+  accessClaims: Record<string, unknown>;
+  identity?: { email: string; name?: string };
+  idTokenThrows?: boolean;
+}): OidcAccessTokenVerifier {
+  const verifyIdTokenEmail = opts.idTokenThrows
+    ? Sinon.stub().rejects(new Error('InvalidAuthState'))
+    : Sinon.stub().resolves(opts.identity);
+  return {
+    verify: Sinon.stub().resolves(opts.accessClaims),
+    verifyIdTokenEmail,
   } as unknown as OidcAccessTokenVerifier;
+}
+
+test('exchange: access sub + id_token email resolves user via fulfill and emits audit', async t => {
+  const verifier = serviceVerifier({
+    accessClaims: { sub: 'oidc-sub-123', jti: 'jti-1' },
+    identity: { email: 'agent-user@affine.pro', name: 'Agent User' },
+  });
 
   const fulfill = Sinon.stub().resolves({ id: 'affine-user-42' });
   const getUserByEmail = Sinon.stub().resolves(null);
@@ -71,14 +87,17 @@ test('exchange: verified email resolves user via fulfill and emits audit event',
     makeConfig({}),
     event
   );
-  const identity = await service.exchange('inbound.jws.token');
+  const identity = await service.exchange('access.tok', 'id.tok');
 
+  t.true((verifier.verify as Sinon.SinonStub).calledOnceWith('access.tok'));
   t.true(
-    (verifier.verifyAndExtractEmail as Sinon.SinonStub).calledOnceWith(
-      'inbound.jws.token'
+    (verifier.verifyIdTokenEmail as Sinon.SinonStub).calledOnceWith(
+      'id.tok',
+      'oidc-sub-123'
     )
   );
   t.is(fulfill.firstCall.args[0], 'agent-user@affine.pro');
+  t.deepEqual(fulfill.firstCall.args[1], { name: 'Agent User' });
   t.deepEqual(identity, { userId: 'affine-user-42', method: 'oauth' });
   t.true(
     event.emit.calledOnceWith('tokenExchange.identityMinted', {
@@ -89,49 +108,11 @@ test('exchange: verified email resolves user via fulfill and emits audit event',
   );
 });
 
-test('exchange: email resolved via userinfo fallback provisions the user', async t => {
-  // Access token had no email; verifier resolved it from the userinfo endpoint.
-  const verifier = {
-    verifyAndExtractEmail: Sinon.stub().resolves({
-      claims: { sub: 'oidc-sub-zitadel', jti: 'jti-z' },
-      email: 'fallback-user@affine.pro',
-    }),
-  } as unknown as OidcAccessTokenVerifier;
-
-  const fulfill = Sinon.stub().resolves({ id: 'affine-user-99' });
-  const getUserByEmail = Sinon.stub().resolves(null);
-  const models = {
-    user: { fulfill, getUserByEmail },
-  } as unknown as Models;
-  const event = makeEvent();
-
-  const service = new TokenExchangeService(
-    verifier,
-    models,
-    makeConfig({}),
-    event
-  );
-  const identity = await service.exchange('inbound.jws.token');
-
-  t.is(fulfill.firstCall.args[0], 'fallback-user@affine.pro');
-  t.deepEqual(identity, { userId: 'affine-user-99', method: 'oauth' });
-  t.true(
-    event.emit.calledOnceWith('tokenExchange.identityMinted', {
-      userId: 'affine-user-99',
-      tokenSub: 'oidc-sub-zitadel',
-      tokenJti: 'jti-z',
-    })
-  );
-});
-
-test('exchange: token without a valid email claim is rejected (trust boundary)', async t => {
-  // Neither the token nor userinfo yielded an email.
-  const verifier = {
-    verifyAndExtractEmail: Sinon.stub().resolves({
-      claims: { sub: 'no-email-sub' },
-      email: undefined,
-    }),
-  } as unknown as OidcAccessTokenVerifier;
+test('exchange: access token without a sub is rejected before touching the id_token', async t => {
+  const verifier = serviceVerifier({
+    accessClaims: { jti: 'no-sub' },
+    identity: { email: 'should-not@affine.pro' },
+  });
   const fulfill = Sinon.stub().resolves({ id: 'should-not-happen' });
   const models = {
     user: { fulfill, getUserByEmail: Sinon.stub() },
@@ -144,17 +125,37 @@ test('exchange: token without a valid email claim is rejected (trust boundary)',
     makeEvent()
   );
 
-  await t.throwsAsync(service.exchange('inbound.jws.token'));
+  await t.throwsAsync(service.exchange('access.tok', 'id.tok'));
+  t.false((verifier.verifyIdTokenEmail as Sinon.SinonStub).called);
+  t.false(fulfill.called);
+});
+
+test('exchange: id_token email resolution failure propagates (no provisioning)', async t => {
+  const verifier = serviceVerifier({
+    accessClaims: { sub: 'sub-1' },
+    idTokenThrows: true,
+  });
+  const fulfill = Sinon.stub().resolves({ id: 'should-not-happen' });
+  const models = {
+    user: { fulfill, getUserByEmail: Sinon.stub() },
+  } as unknown as Models;
+
+  const service = new TokenExchangeService(
+    verifier,
+    models,
+    makeConfig({}),
+    makeEvent()
+  );
+
+  await t.throwsAsync(service.exchange('access.tok', 'id.tok'));
   t.false(fulfill.called);
 });
 
 test('exchange: new user + allowSignupForOauth=false is forbidden (no provisioning)', async t => {
-  const verifier = {
-    verifyAndExtractEmail: Sinon.stub().resolves({
-      claims: {},
-      email: 'new-user@affine.pro',
-    }),
-  } as unknown as OidcAccessTokenVerifier;
+  const verifier = serviceVerifier({
+    accessClaims: { sub: 'sub-1' },
+    identity: { email: 'new-user@affine.pro' },
+  });
   const fulfill = Sinon.stub().resolves({ id: 'should-not-happen' });
   const getUserByEmail = Sinon.stub().resolves(null);
   const models = {
@@ -168,17 +169,15 @@ test('exchange: new user + allowSignupForOauth=false is forbidden (no provisioni
     makeEvent()
   );
 
-  await t.throwsAsync(service.exchange('inbound.jws.token'));
+  await t.throwsAsync(service.exchange('access.tok', 'id.tok'));
   t.false(fulfill.called);
 });
 
 test('exchange: existing user resolves even when allowSignupForOauth=false', async t => {
-  const verifier = {
-    verifyAndExtractEmail: Sinon.stub().resolves({
-      claims: {},
-      email: 'existing@affine.pro',
-    }),
-  } as unknown as OidcAccessTokenVerifier;
+  const verifier = serviceVerifier({
+    accessClaims: { sub: 'sub-1' },
+    identity: { email: 'existing@affine.pro' },
+  });
   const fulfill = Sinon.stub().resolves({ id: 'affine-user-7' });
   const getUserByEmail = Sinon.stub().resolves({ id: 'affine-user-7' });
   const models = {
@@ -192,7 +191,7 @@ test('exchange: existing user resolves even when allowSignupForOauth=false', asy
     makeEvent()
   );
 
-  const identity = await service.exchange('inbound.jws.token');
+  const identity = await service.exchange('access.tok', 'id.tok');
   t.is(identity.userId, 'affine-user-7');
   t.true(fulfill.calledOnce);
 });
@@ -222,11 +221,16 @@ test('controller: valid secret + RFC 8693 body → SessionIssuer.issue, returns 
   await controller.exchange(
     req,
     res,
-    makeBody('inbound.jws.token'),
+    makeBody('inbound.jws.token', 'inbound.id.token'),
     'top-secret'
   );
 
-  t.true(tokenExchange.exchange.calledOnceWith('inbound.jws.token'));
+  t.true(
+    tokenExchange.exchange.calledOnceWith(
+      'inbound.jws.token',
+      'inbound.id.token'
+    )
+  );
   t.true(issue.calledOnce);
   t.is(issue.firstCall.args[0], req);
   t.is(issue.firstCall.args[1], res);
@@ -314,7 +318,25 @@ test('controller: valid secret but malformed RFC 8693 body is rejected', async t
     controller.exchange(
       {} as Request,
       res,
-      { grant_type: GRANT, subject_token_type: TOKEN_TYPE },
+      {
+        grant_type: GRANT,
+        subject_token_type: ACCESS_TOKEN_TYPE,
+        actor_token: 'id',
+        actor_token_type: ID_TOKEN_TYPE,
+      },
+      'top-secret'
+    )
+  );
+  // missing actor_token (id_token) — no fallback, so this must be rejected
+  await t.throwsAsync(
+    controller.exchange(
+      {} as Request,
+      res,
+      {
+        grant_type: GRANT,
+        subject_token: 't',
+        subject_token_type: ACCESS_TOKEN_TYPE,
+      },
       'top-secret'
     )
   );
@@ -323,7 +345,13 @@ test('controller: valid secret but malformed RFC 8693 body is rejected', async t
     controller.exchange(
       {} as Request,
       res,
-      { grant_type: 'authorization_code', subject_token: 't', subject_token_type: TOKEN_TYPE },
+      {
+        grant_type: 'authorization_code',
+        subject_token: 't',
+        subject_token_type: ACCESS_TOKEN_TYPE,
+        actor_token: 'id',
+        actor_token_type: ID_TOKEN_TYPE,
+      },
       'top-secret'
     )
   );

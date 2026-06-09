@@ -38,33 +38,40 @@ export class TokenExchangeService {
   ) {}
 
   /**
-   * verify → extract email → resolve/auto-provision → VerifiedIdentity.
+   * verify → bind id_token → extract email → resolve/auto-provision → identity.
    *
    * Headless analog of `OAuthService.verifyCallbackIdentity`:
    *   - login path:  getToken → getUser → getOrCreateUserFromOauth → identity
-   *   - this path:   verify(access_token) → email → fulfill → identity
+   *   - this path:   verify(access_token) → email(id_token) → fulfill → identity
    *
    * Auto-provision is gated on `auth.allowSignupForOauth`, identical to
    * `OAuthService.getOrCreateUserFromOauth` — so an operator who disables OAuth
    * signups also disables provisioning via token-exchange.
    */
-  async exchange(accessToken: string): Promise<VerifiedIdentity> {
-    // Verify the access token and resolve the verified subject's email. The
-    // verifier reads it from the token claims when present, and otherwise falls
-    // back to the OIDC userinfo endpoint — many providers (e.g. Zitadel) scope
-    // `email` to the id_token/userinfo, not the access token.
-    const { claims, email } = await this.verifier.verifyAndExtractEmail(
-      accessToken
-    );
-
-    // Email is the canonical OIDC join key. If neither the token nor userinfo
-    // yields one, reject rather than guess.
-    if (!email) {
+  async exchange(
+    accessToken: string,
+    idToken: string
+  ): Promise<VerifiedIdentity> {
+    // Verify the access token (RFC 8693 subject_token) — enforces the resource
+    // audience and yields the authorized subject. The access token does not
+    // carry email (Zitadel-style); that comes from the id_token next.
+    const claims = await this.verifier.verify(accessToken);
+    const sub = typeof claims.sub === 'string' ? claims.sub : undefined;
+    if (!sub) {
       this.logger.warn(
-        'Inbound access token has no `email` claim (token or userinfo); cannot resolve user'
+        'Inbound access token has no `sub` claim; cannot resolve user'
       );
       throw new InvalidAuthState();
     }
+
+    // Resolve email (+ name) from the id_token (RFC 8693 actor_token), bound to
+    // the same subject. No userinfo hop, no fallback — `verifyIdTokenEmail`
+    // fails fast with a precise cause if the id_token is bad, mismatched, or
+    // carries no email.
+    const { email, name } = await this.verifier.verifyIdTokenEmail(
+      idToken,
+      sub
+    );
     validators.assertValidEmail(email);
 
     const existing = await this.models.user.getUserByEmail(email);
@@ -74,16 +81,15 @@ export class TokenExchangeService {
 
     // Resolve existing user by email, or create a registered, email-verified
     // user — the same `models.user.fulfill(...)` call the OAuth signup path
-    // makes (`plugins/oauth/service.ts`).
-    const user = await this.models.user.fulfill(email, {
-      name: typeof claims.name === 'string' ? claims.name : undefined,
-    });
+    // makes (`plugins/oauth/service.ts`). The display name comes from the
+    // id_token (the access token carries no profile claims).
+    const user = await this.models.user.fulfill(email, { name });
 
     // Audit: "trusted caller acted AS user X" provenance, wired through
     // AFFiNE's event system rather than a bespoke log sink.
     this.event.emit('tokenExchange.identityMinted', {
       userId: user.id,
-      tokenSub: typeof claims.sub === 'string' ? claims.sub : undefined,
+      tokenSub: sub,
       tokenJti: typeof claims.jti === 'string' ? claims.jti : undefined,
     });
 

@@ -27,17 +27,25 @@ import { OidcAccessTokenVerifier } from './verifier';
 const TOKEN_EXCHANGE_GRANT_TYPE =
   'urn:ietf:params:oauth:grant-type:token-exchange';
 const ACCESS_TOKEN_TYPE = 'urn:ietf:params:oauth:token-type:access_token';
+const ID_TOKEN_TYPE = 'urn:ietf:params:oauth:token-type:id_token';
 const TRUSTED_PROXY_SECRET_HEADER = 'x-affine-trusted-proxy-secret';
 
 /**
  * RFC 8693 OAuth 2.0 Token Exchange request body (the subset this endpoint
  * accepts). The request is validated with zod, mirroring how
  * `OAuthController` validates its callback body (`plugins/oauth/controller.ts`).
+ *
+ * Both tokens are REQUIRED — there is no userinfo fallback. The `subject_token`
+ * (access token) authorizes the exchange and carries the audience-checked
+ * subject; the `actor_token` (id_token) carries the `email`. A request missing
+ * either fails validation here (`BadRequest`) rather than degrading.
  */
 const TokenExchangeBodySchema = z.object({
   grant_type: z.literal(TOKEN_EXCHANGE_GRANT_TYPE),
   subject_token: z.string().min(1),
   subject_token_type: z.literal(ACCESS_TOKEN_TYPE),
+  actor_token: z.string().min(1),
+  actor_token_type: z.literal(ID_TOKEN_TYPE),
 });
 
 /**
@@ -53,13 +61,16 @@ const TokenExchangeBodySchema = z.object({
  *   - `grant_type=urn:ietf:params:oauth:grant-type:token-exchange`
  *   - `subject_token=<external OIDC access token>` — the user's verified token.
  *   - `subject_token_type=urn:ietf:params:oauth:token-type:access_token`
+ *   - `actor_token=<external OIDC id_token>` — carries the user's `email`.
+ *   - `actor_token_type=urn:ietf:params:oauth:token-type:id_token`
  *   - header `x-affine-trusted-proxy-secret: <secret>` — proof the caller is
  *     the deployment's sanctioned reverse-proxy/BFF, not an arbitrary client.
  *
  * Trust boundary: verified user token AND constant-time trusted-proxy-secret
  * match. The endpoint is publicly routable, so a leaked user token alone must
  * not mint a session — the shared secret binds minting to the trusted front
- * door. The email is taken from verified token claims only, never a raw header.
+ * door. The email is taken from the verified id_token (bound to the access
+ * token's subject), never a raw header or an out-of-band userinfo call.
  *
  * Outbound (RFC 8693 token-exchange response shape, plus a session cookie):
  *   - `access_token` — the AFFiNE session id (set as the `affine_session`
@@ -89,7 +100,10 @@ export class TokenExchangeController {
     // Inert when unconfigured: if the operator has not opted in (no trusted
     // proxy secret) or the OIDC provider is not set up (no issuer/JWKS), the
     // endpoint does not exist as far as any caller can tell.
-    if (!this.config.tokenExchange.trustedProxySecret || !this.verifier.configured) {
+    if (
+      !this.config.tokenExchange.trustedProxySecret ||
+      !this.verifier.configured
+    ) {
       throw new NotFound();
     }
 
@@ -102,7 +116,10 @@ export class TokenExchangeController {
       throw new BadRequest('Malformed RFC 8693 token-exchange request');
     }
 
-    const identity = await this.tokenExchange.exchange(input.data.subject_token);
+    const identity = await this.tokenExchange.exchange(
+      input.data.subject_token,
+      input.data.actor_token
+    );
 
     // Canonical session mint — the same call `OAuthController.callback` makes.
     // Sets the `affine_session` + csrf cookies on `res` and returns the handle.
